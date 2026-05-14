@@ -5,7 +5,7 @@ Go SDK for [CubeSandbox](https://github.com/TencentCloud/CubeSandbox). It matche
 ## Install
 
 ```bash
-go get github.com/tencentcloud/CubeSandbox/sdk/go
+go get github.com/nemo1105/CubeSandbox/sdk/go
 ```
 
 ## Configuration
@@ -31,7 +31,7 @@ import (
 	"context"
 	"fmt"
 
-	cubesandbox "github.com/tencentcloud/CubeSandbox/sdk/go"
+	cubesandbox "github.com/nemo1105/CubeSandbox/sdk/go"
 )
 
 func main() {

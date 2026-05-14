@@ -1,3 +1,3 @@
-module github.com/tencentcloud/CubeSandbox/sdk/go
+module github.com/nemo1105/CubeSandbox/sdk/go
 
 go 1.22
