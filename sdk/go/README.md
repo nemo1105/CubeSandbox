@@ -17,10 +17,12 @@ export CUBE_TEMPLATE_ID=<your-template-id>
 # Optional remote data-plane access.
 export CUBE_PROXY_NODE_IP=<cubeproxy-node-ip>
 export CUBE_PROXY_PORT_HTTP=80
+export CUBE_PROXY_SCHEME=http
 export CUBE_SANDBOX_DOMAIN=cube.app
 ```
 
 `NewConfigFromEnv` also accepts `E2B_API_URL` and `E2B_API_KEY`; `CUBE_API_URL` and `CUBE_API_KEY` take precedence.
+`CUBE_PROXY_SCHEME` supports `http` and `https`; when omitted, port `443` defaults to `https` and other ports default to `http`.
 
 ## Create And Run Code
 
@@ -37,6 +39,7 @@ import (
 func main() {
 	ctx := context.Background()
 	client := cubesandbox.NewClient(cubesandbox.NewConfigFromEnv())
+	defer client.Close()
 
 	sb, err := client.Create(ctx, cubesandbox.CreateOptions{})
 	if err != nil {
@@ -52,6 +55,10 @@ func main() {
 }
 ```
 
+`Client.Close` releases local idle HTTP connections held by the SDK client. It does not pause or destroy remote sandboxes.
+Use `Sandbox.Kill` to destroy a sandbox, or `Sandbox.Pause` when you want to keep the sandbox for a later `Client.Connect`.
+When `WithHTTPClient` is used with a shared `*http.Client`, `Client.Close` also closes that shared client's idle connections.
+
 ## Commands
 
 ```go
@@ -62,11 +69,15 @@ if err != nil {
 fmt.Println(result.Stdout, result.Stderr, result.ExitCode)
 ```
 
+`Commands.Run` starts `/bin/bash -l -c <command>` through envd's `process.Process/Start` API and returns stdout, stderr, and the `EndEvent` exit code. Callers are still responsible for treating untrusted shell input carefully.
+
 ## Files
 
 ```go
 content, err := sb.Files().Read(ctx, "/etc/hosts")
 ```
+
+`Files.Read` downloads content through envd's `GET /files?path=...` file API.
 
 ## Pause And Connect
 
@@ -113,6 +124,7 @@ sb, err := client.Create(ctx, cubesandbox.CreateOptions{
 When `CUBE_PROXY_NODE_IP` is set, data-plane requests connect directly to that IP and port while preserving the virtual sandbox host:
 
 ```text
+URL:  <CUBE_PROXY_SCHEME>://49999-<sandboxID>.<CUBE_SANDBOX_DOMAIN>/<envd-endpoint>
 TCP:  <CUBE_PROXY_NODE_IP>:<CUBE_PROXY_PORT_HTTP>
 Host: 49999-<sandboxID>.<CUBE_SANDBOX_DOMAIN>
 ```
@@ -125,6 +137,7 @@ cfg := cubesandbox.Config{
 	TemplateID:     "tpl-xxxxxxxx",
 	ProxyNodeIP:    "10.0.0.1",
 	ProxyPortHTTP:  80,
+	ProxyScheme:    "http",
 	SandboxDomain:  "cube.app",
 }
 client := cubesandbox.NewClient(cfg)
@@ -145,6 +158,7 @@ export CUBE_API_URL=http://<your-cubeapi-host>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
 export CUBE_PROXY_NODE_IP=<your-cubeproxy-node-ip>
 export CUBE_PROXY_PORT_HTTP=80
+export CUBE_PROXY_SCHEME=http
 export CUBE_SANDBOX_DOMAIN=cube.app
 go test -tags=integration -run Integration -count=1 ./...
 ```

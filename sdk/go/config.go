@@ -25,6 +25,7 @@ type Config struct {
 	TemplateID     string
 	ProxyNodeIP    string
 	ProxyPortHTTP  int
+	ProxyScheme    string
 	SandboxDomain  string
 	Timeout        time.Duration
 	RequestTimeout time.Duration
@@ -41,6 +42,7 @@ func NewConfigFromEnv() Config {
 		TemplateID:     strings.TrimSpace(os.Getenv("CUBE_TEMPLATE_ID")),
 		ProxyNodeIP:    strings.TrimSpace(os.Getenv("CUBE_PROXY_NODE_IP")),
 		ProxyPortHTTP:  parseIntEnv("CUBE_PROXY_PORT_HTTP", defaultProxyPortHTTP),
+		ProxyScheme:    strings.TrimSpace(os.Getenv("CUBE_PROXY_SCHEME")),
 		SandboxDomain:  strings.TrimSpace(os.Getenv("CUBE_SANDBOX_DOMAIN")),
 		Timeout:        parseDurationEnv("CUBE_TIMEOUT", defaultSandboxTimeout),
 		RequestTimeout: parseDurationEnv("CUBE_REQUEST_TIMEOUT", defaultRequestTimeout),
@@ -60,6 +62,7 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.ProxyPortHTTP <= 0 {
 		cfg.ProxyPortHTTP = defaultProxyPortHTTP
 	}
+	cfg.ProxyScheme = normalizeProxyScheme(cfg.ProxyScheme, cfg.ProxyPortHTTP)
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultSandboxTimeout
 	}
@@ -67,6 +70,18 @@ func normalizeConfig(cfg Config) Config {
 		cfg.RequestTimeout = defaultRequestTimeout
 	}
 	return cfg
+}
+
+func normalizeProxyScheme(scheme string, port int) string {
+	normalized := strings.ToLower(strings.TrimSpace(scheme))
+	switch normalized {
+	case "http", "https":
+		return normalized
+	}
+	if port == 443 {
+		return "https"
+	}
+	return "http"
 }
 
 func firstEnv(names ...string) string {

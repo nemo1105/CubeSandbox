@@ -6,20 +6,19 @@ package cubesandbox
 import (
 	"context"
 	"fmt"
-	"strconv"
 )
 
 type Files struct {
-	runner codeRunner
+	reader fileReader
+}
+
+type fileReader interface {
+	readFile(context.Context, string) (string, error)
 }
 
 func (f *Files) Read(ctx context.Context, path string) (string, error) {
-	execution, err := f.runner.RunCode(ctx, "open("+strconv.Quote(path)+").read()", RunCodeOptions{})
-	if err != nil {
-		return "", err
+	if f == nil || f.reader == nil {
+		return "", fmt.Errorf("files is not attached to a sandbox")
 	}
-	if execution.Error != nil {
-		return "", fmt.Errorf("Failed to read %s: %s", path, execution.Error.Value)
-	}
-	return execution.mainText(), nil
+	return f.reader.readFile(ctx, path)
 }

@@ -39,6 +39,40 @@ func TestWithHTTPClientOption(t *testing.T) {
 	}
 }
 
+func TestClientClose(t *testing.T) {
+	var nilClient *Client
+	if err := nilClient.Close(); err != nil {
+		t.Fatalf("nil Client.Close returned error: %v", err)
+	}
+
+	controlTransport := &closeCountingTransport{}
+	dataTransport := &closeCountingTransport{}
+	client := &Client{
+		controlHTTP: &http.Client{Transport: controlTransport},
+		dataHTTP:    &http.Client{Transport: dataTransport},
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Client.Close returned error: %v", err)
+	}
+	if controlTransport.closes != 1 || dataTransport.closes != 1 {
+		t.Fatalf("close count mismatch: control=%d data=%d", controlTransport.closes, dataTransport.closes)
+	}
+
+	sharedTransport := &closeCountingTransport{}
+	sharedHTTP := &http.Client{Transport: sharedTransport}
+	client = NewClient(Config{}, WithHTTPClient(sharedHTTP))
+	if err := client.Close(); err != nil {
+		t.Fatalf("Client.Close with shared HTTP client returned error: %v", err)
+	}
+	if sharedTransport.closes != 1 {
+		t.Fatalf("shared HTTP client closed %d times, want 1", sharedTransport.closes)
+	}
+
+	if err := NewClient(Config{}).Close(); err != nil {
+		t.Fatalf("default Client.Close returned error: %v", err)
+	}
+}
+
 func TestClientRequestErrorPaths(t *testing.T) {
 	client := NewClient(Config{APIURL: "http://127.0.0.1:1"})
 
@@ -278,13 +312,21 @@ func TestKillErrorPath(t *testing.T) {
 	}
 }
 
-func TestCloseBranchesAndAccessors(t *testing.T) {
-	if err := (&Sandbox{}).Close(); err != nil {
-		t.Fatalf("Close without client returned error: %v", err)
+func TestSandboxAccessors(t *testing.T) {
+	if err := (*Sandbox)(nil).Close(); err != nil {
+		t.Fatalf("nil Sandbox.Close returned error: %v", err)
 	}
-	sb := &Sandbox{client: NewClient(Config{})}
+	if err := (&Sandbox{}).Close(); err != nil {
+		t.Fatalf("detached Sandbox.Close returned error: %v", err)
+	}
+
+	transport := &closeCountingTransport{}
+	sb := &Sandbox{client: &Client{controlHTTP: &http.Client{Transport: transport}}}
 	if err := sb.Close(); err != nil {
-		t.Fatalf("Close returned error: %v", err)
+		t.Fatalf("Sandbox.Close returned error: %v", err)
+	}
+	if transport.closes != 1 {
+		t.Fatalf("Sandbox.Close closed idle connections %d times, want 1", transport.closes)
 	}
 	if sb.Commands() == nil {
 		t.Fatal("Commands returned nil")
@@ -326,7 +368,7 @@ func TestRunCodeErrorPaths(t *testing.T) {
 			}, nil
 		})}))
 		sb := &Sandbox{client: client, SandboxID: "sb-run", Domain: "cube.test"}
-		err := errorFromRunCode(sb.RunCode(context.Background(), "1", RunCodeOptions{}))
+		_, err := sb.RunCode(context.Background(), "1", RunCodeOptions{})
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadGateway {
 			t.Fatalf("RunCode error=%v", err)
@@ -369,30 +411,29 @@ func TestRunCodeErrorPaths(t *testing.T) {
 
 func TestCommandFallbacksAndErrors(t *testing.T) {
 	boom := errors.New("boom")
-	_, err := (&Commands{runner: &fakeRunner{err: boom}}).Run(context.Background(), "echo x", CommandOptions{})
+	_, err := (&Commands{starter: &fakeProcessStarter{err: boom}}).Run(context.Background(), "echo x", CommandOptions{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("command error=%v", err)
 	}
 
-	result, err := (&Commands{runner: &fakeRunner{
-		execution: &Execution{
-			Logs: Logs{
-				Stdout: []string{"out\n"},
-				Stderr: []string{"err\n"},
-			},
-			Error: &ExecutionError{Name: "RuntimeError", Value: "bad"},
+	result, err := (&Commands{starter: &fakeProcessStarter{
+		result: &processStartResult{
+			Stdout:   "out\n",
+			Stderr:   "err\n",
+			ExitCode: 1,
 		},
 	}}).Run(context.Background(), "bad", CommandOptions{})
 	if err != nil {
-		t.Fatalf("command fallback returned error: %v", err)
+		t.Fatalf("command returned error: %v", err)
 	}
 	if result.ExitCode != 1 || result.Stdout != "out\n" || result.Stderr != "err\n" {
-		t.Fatalf("fallback result=%#v", result)
+		t.Fatalf("result=%#v", result)
 	}
 
-	result, err = (&Commands{runner: &fakeRunner{
-		stdoutCallbacks: []string{"-2\n"},
-		execution:       &Execution{},
+	result, err = (&Commands{starter: &fakeProcessStarter{
+		result: &processStartResult{
+			ExitCode: -2,
+		},
 	}}).Run(context.Background(), "exit -2", CommandOptions{})
 	if err != nil {
 		t.Fatalf("negative command returned error: %v", err)
@@ -400,25 +441,25 @@ func TestCommandFallbacksAndErrors(t *testing.T) {
 	if result.ExitCode != -2 || result.Stdout != "" {
 		t.Fatalf("negative result=%#v", result)
 	}
+
+	if _, err = (&Commands{}).Run(context.Background(), "true", CommandOptions{}); err == nil || !strings.Contains(err.Error(), "not attached") {
+		t.Fatalf("unattached commands error=%v", err)
+	}
 }
 
-func TestFilesReadRunCodeErrorAndMainTextFallback(t *testing.T) {
+func TestFilesReadErrorAndMainTextFallback(t *testing.T) {
 	boom := errors.New("boom")
-	if _, err := (&Files{runner: &fakeRunner{err: boom}}).Read(context.Background(), "/tmp/x"); !errors.Is(err, boom) {
+	if _, err := (&Files{reader: &fakeFileReader{err: boom}}).Read(context.Background(), "/tmp/x"); !errors.Is(err, boom) {
 		t.Fatalf("Files.Read error=%v", err)
 	}
 
-	content, err := (&Files{runner: &fakeRunner{execution: &Execution{
-		Results: []Result{
-			{Text: "side"},
-			{Text: "main", IsMainResult: true},
-		},
-	}}}).Read(context.Background(), "/tmp/x")
-	if err != nil {
-		t.Fatalf("Files.Read returned error: %v", err)
-	}
-	if content != "main" {
+	content, err := (&Files{reader: &fakeFileReader{content: "main"}}).Read(context.Background(), "/tmp/x")
+	if err != nil || content != "main" {
 		t.Fatalf("content=%q", content)
+	}
+
+	if _, err = (&Files{}).Read(context.Background(), "/tmp/x"); err == nil || !strings.Contains(err.Error(), "not attached") {
+		t.Fatalf("unattached files error=%v", err)
 	}
 
 	if got := (*Execution)(nil).mainText(); got != "" {
@@ -446,6 +487,16 @@ func TestConfigParsingEdges(t *testing.T) {
 		t.Fatalf("parsed int=%d", got)
 	}
 
+	if got := normalizeProxyScheme("", 443); got != "https" {
+		t.Fatalf("default 443 proxy scheme=%q", got)
+	}
+	if got := normalizeProxyScheme("HTTPS", 80); got != "https" {
+		t.Fatalf("explicit proxy scheme=%q", got)
+	}
+	if got := normalizeProxyScheme("ftp", 80); got != "http" {
+		t.Fatalf("invalid proxy scheme fallback=%q", got)
+	}
+
 	t.Setenv("CUBE_TIMEOUT", "-2s")
 	if got := parseDurationEnv("CUBE_TIMEOUT", 7*time.Second); got != 7*time.Second {
 		t.Fatalf("negative duration=%s", got)
@@ -464,26 +515,6 @@ func TestConfigParsingEdges(t *testing.T) {
 	}
 	if got := durationSeconds(1500 * time.Millisecond); got != 2 {
 		t.Fatalf("durationSeconds(1.5s)=%d", got)
-	}
-}
-
-func TestCommandStringHelpers(t *testing.T) {
-	if got := splitLines(""); got != nil {
-		t.Fatalf("splitLines empty=%#v", got)
-	}
-	if got := splitLines("a\r\nb\rc\n"); strings.Join(got, ",") != "a,b,c" {
-		t.Fatalf("splitLines normalized=%#v", got)
-	}
-	for _, value := range []string{"", "-"} {
-		if isIntegerLine(value) {
-			t.Fatalf("isIntegerLine(%q)=true", value)
-		}
-	}
-	if !isIntegerLine("-12") {
-		t.Fatal("isIntegerLine(-12)=false")
-	}
-	if isIntegerLine("12x") {
-		t.Fatal("isIntegerLine(12x)=true")
 	}
 }
 
@@ -567,14 +598,26 @@ func TestParseLineMalformedTypedEventsAndTracebackEdges(t *testing.T) {
 	}
 }
 
-func errorFromRunCode(_ *Execution, err error) error {
-	return err
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type closeCountingTransport struct {
+	closes int
+}
+
+func (t *closeCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusNoContent,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    req,
+	}, nil
+}
+
+func (t *closeCountingTransport) CloseIdleConnections() {
+	t.closes++
 }
 
 type errReaderCloser struct{}

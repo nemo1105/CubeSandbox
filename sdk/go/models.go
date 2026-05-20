@@ -76,6 +76,8 @@ type RunCodeOptions struct {
 
 type CommandOptions struct {
 	Timeout time.Duration
+	Envs    map[string]string
+	Cwd     string
 }
 
 type CommandResult struct {

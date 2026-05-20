@@ -5,6 +5,8 @@ package cubesandbox
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +31,9 @@ func TestNewConfigFromEnv(t *testing.T) {
 	if cfg.ProxyPortHTTP != 80 {
 		t.Fatalf("ProxyPortHTTP=%d, want 80", cfg.ProxyPortHTTP)
 	}
+	if cfg.ProxyScheme != "http" {
+		t.Fatalf("ProxyScheme=%q, want http", cfg.ProxyScheme)
+	}
 	if cfg.SandboxDomain != "cube.app" {
 		t.Fatalf("SandboxDomain=%q, want cube.app", cfg.SandboxDomain)
 	}
@@ -43,6 +48,7 @@ func TestNewConfigFromEnv(t *testing.T) {
 	t.Setenv("CUBE_TEMPLATE_ID", "tpl-env")
 	t.Setenv("CUBE_PROXY_NODE_IP", "10.0.0.8")
 	t.Setenv("CUBE_PROXY_PORT_HTTP", "9090")
+	t.Setenv("CUBE_PROXY_SCHEME", "https")
 	t.Setenv("CUBE_SANDBOX_DOMAIN", "sandbox.internal")
 	t.Setenv("CUBE_TIMEOUT", "600")
 	t.Setenv("CUBE_REQUEST_TIMEOUT", "2s")
@@ -56,6 +62,9 @@ func TestNewConfigFromEnv(t *testing.T) {
 	}
 	if cfg.ProxyNodeIP != "10.0.0.8" || cfg.ProxyPortHTTP != 9090 {
 		t.Fatalf("proxy mismatch: %#v", cfg)
+	}
+	if cfg.ProxyScheme != "https" {
+		t.Fatalf("ProxyScheme=%q", cfg.ProxyScheme)
 	}
 	if cfg.SandboxDomain != "sandbox.internal" {
 		t.Fatalf("SandboxDomain=%q", cfg.SandboxDomain)
@@ -453,65 +462,252 @@ func TestRunCodeUsesProxyNodeIPAndPreservesHost(t *testing.T) {
 	}
 }
 
+func TestRunCodeUsesConfiguredProxyScheme(t *testing.T) {
+	var gotScheme string
+	client := NewClient(Config{
+		ProxyScheme: "https",
+	}, WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotScheme = req.URL.Scheme
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})}))
+	sb := &Sandbox{client: client, SandboxID: "sb-scheme", Domain: "cube.test"}
+
+	if _, err := sb.RunCode(context.Background(), "1", RunCodeOptions{}); err != nil {
+		t.Fatalf("RunCode: %v", err)
+	}
+	if gotScheme != "https" {
+		t.Fatalf("scheme=%q", gotScheme)
+	}
+}
+
 func TestCommandsRun(t *testing.T) {
-	runner := &fakeRunner{
-		stdoutCallbacks: []string{"hello\nworld\n0\n"},
-		execution: &Execution{
-			Logs: Logs{Stderr: []string{"warn\n"}},
+	starter := &fakeProcessStarter{
+		result: &processStartResult{
+			Stdout:   "hello\nworld\n",
+			Stderr:   "warn\n",
+			ExitCode: 0,
 		},
 	}
-	commands := &Commands{runner: runner}
+	commands := &Commands{starter: starter}
 
-	result, err := commands.Run(context.Background(), "echo hello", CommandOptions{Timeout: 5 * time.Second})
+	result, err := commands.Run(context.Background(), "echo hello", CommandOptions{
+		Timeout: 5 * time.Second,
+		Envs:    map[string]string{"A": "B"},
+		Cwd:     "/work",
+	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !strings.Contains(runner.code, `_sp.run("echo hello", shell=True`) {
-		t.Fatalf("wrapper code mismatch:\n%s", runner.code)
+	if starter.payload.Process.Cmd != "/bin/bash" {
+		t.Fatalf("process cmd=%q", starter.payload.Process.Cmd)
 	}
-	if runner.opts.Timeout != 5*time.Second {
-		t.Fatalf("timeout=%s", runner.opts.Timeout)
+	if got := strings.Join(starter.payload.Process.Args, "\x00"); got != "-l\x00-c\x00echo hello" {
+		t.Fatalf("process args=%#v", starter.payload.Process.Args)
+	}
+	if starter.payload.Process.Envs["A"] != "B" || starter.payload.Process.Cwd != "/work" {
+		t.Fatalf("process env/cwd mismatch: %#v", starter.payload.Process)
+	}
+	if starter.payload.Stdin == nil || *starter.payload.Stdin {
+		t.Fatalf("stdin=%v, want false", starter.payload.Stdin)
+	}
+	if starter.opts.Timeout != 5*time.Second {
+		t.Fatalf("timeout=%s", starter.opts.Timeout)
 	}
 	if result.Stdout != "hello\nworld\n" || result.Stderr != "warn\n" || result.ExitCode != 0 {
 		t.Fatalf("result=%#v", result)
 	}
 
-	runner = &fakeRunner{
-		stdoutCallbacks: []string{"1\n"},
-		execution:       &Execution{},
+	starter = &fakeProcessStarter{
+		result: &processStartResult{ExitCode: 1},
 	}
-	result, err = (&Commands{runner: runner}).Run(context.Background(), "false", CommandOptions{})
+	result, err = (&Commands{starter: starter}).Run(context.Background(), "false", CommandOptions{})
 	if err != nil {
 		t.Fatalf("Run false: %v", err)
 	}
 	if result.ExitCode != 1 {
 		t.Fatalf("exit code=%d", result.ExitCode)
 	}
+
+	starter = &fakeProcessStarter{
+		result: &processStartResult{Stdout: "42\n"},
+	}
+	result, err = (&Commands{starter: starter}).Run(context.Background(), "echo 42", CommandOptions{})
+	if err != nil {
+		t.Fatalf("Run numeric stdout: %v", err)
+	}
+	if result.Stdout != "42\n" || result.ExitCode != 0 {
+		t.Fatalf("numeric stdout result=%#v", result)
+	}
 }
 
 func TestFilesRead(t *testing.T) {
-	runner := &fakeRunner{execution: &Execution{Text: "file content"}}
-	content, err := (&Files{runner: runner}).Read(context.Background(), "/tmp/foo.txt")
+	reader := &fakeFileReader{content: "file content"}
+	content, err := (&Files{reader: reader}).Read(context.Background(), "/tmp/foo.txt")
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 	if content != "file content" {
 		t.Fatalf("content=%q", content)
 	}
-	if runner.code != `open("/tmp/foo.txt").read()` {
-		t.Fatalf("code=%q", runner.code)
+	if reader.path != "/tmp/foo.txt" {
+		t.Fatalf("path=%q", reader.path)
 	}
 
-	runner = &fakeRunner{execution: &Execution{}}
-	content, err = (&Files{runner: runner}).Read(context.Background(), "/tmp/empty.txt")
+	reader = &fakeFileReader{}
+	content, err = (&Files{reader: reader}).Read(context.Background(), "/tmp/empty.txt")
 	if err != nil || content != "" {
 		t.Fatalf("empty content=%q err=%v", content, err)
 	}
 
-	runner = &fakeRunner{execution: &Execution{Error: &ExecutionError{Name: "FileNotFoundError", Value: "No such file"}}}
-	_, err = (&Files{runner: runner}).Read(context.Background(), "/tmp/missing.txt")
-	if err == nil || !strings.Contains(err.Error(), "Failed to read /tmp/missing.txt: No such file") {
+	reader = &fakeFileReader{err: fmt.Errorf("failed to read /tmp/missing.txt: No such file")}
+	_, err = (&Files{reader: reader}).Read(context.Background(), "/tmp/missing.txt")
+	if err == nil || !strings.Contains(err.Error(), "failed to read /tmp/missing.txt: No such file") {
 		t.Fatalf("expected read error, got %v", err)
+	}
+}
+
+func TestCommandsRunUsesEnvdProcessStart(t *testing.T) {
+	var gotHost string
+	var gotPayload map[string]any
+	var gotHeaders http.Header
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/process.Process/Start" {
+			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+		}
+		gotHost = r.Host
+		gotHeaders = r.Header.Clone()
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		w.Header().Set("Content-Type", connectContentType)
+		w.Write(connectEnvelope(0, `{"event":{"start":{"pid":123}}}`))
+		w.Write(connectEnvelope(0, fmt.Sprintf(`{"event":{"data":{"stdout":%q}}}`, base64.StdEncoding.EncodeToString([]byte("cmd-out\n")))))
+		w.Write(connectEnvelope(0, fmt.Sprintf(`{"event":{"data":{"stderr":%q}}}`, base64.StdEncoding.EncodeToString([]byte("cmd-err\n")))))
+		w.Write(connectEnvelope(0, `{"event":{"end":{"exitCode":7,"exited":true,"status":"exited"}}}`))
+		w.Write(connectEnvelope(connectEndStreamFlag, `{}`))
+	}))
+	defer server.Close()
+
+	host, port := serverHostPort(t, server.URL)
+	client := NewClient(Config{
+		ProxyNodeIP:    host,
+		ProxyPortHTTP:  port,
+		SandboxDomain:  "cube.test",
+		RequestTimeout: time.Second,
+	})
+	sb := &Sandbox{
+		client:          client,
+		SandboxID:       "sb-proc",
+		TemplateID:      "tpl-test",
+		EnvdAccessToken: "envd-token",
+	}
+
+	result, err := sb.Commands().Run(context.Background(), "echo hello", CommandOptions{
+		Timeout: 1500 * time.Millisecond,
+		Envs:    map[string]string{"A": "B"},
+		Cwd:     "/work",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if gotHost != "49999-sb-proc.cube.test" {
+		t.Fatalf("Host=%q", gotHost)
+	}
+	if gotHeaders.Get("Content-Type") != connectContentType || gotHeaders.Get("Connect-Protocol-Version") != connectProtocolVersion {
+		t.Fatalf("connect headers=%#v", gotHeaders)
+	}
+	if gotHeaders.Get("Connect-Timeout-Ms") != "1500" || gotHeaders.Get("X-Access-Token") != "envd-token" {
+		t.Fatalf("headers=%#v", gotHeaders)
+	}
+
+	processPayload, ok := gotPayload["process"].(map[string]any)
+	if !ok {
+		t.Fatalf("process payload=%#v", gotPayload["process"])
+	}
+	assertString(t, processPayload, "cmd", "/bin/bash")
+	assertString(t, processPayload, "cwd", "/work")
+	args, ok := processPayload["args"].([]any)
+	if !ok || len(args) != 3 || args[0] != "-l" || args[1] != "-c" || args[2] != "echo hello" {
+		t.Fatalf("args=%#v", processPayload["args"])
+	}
+	assertMapString(t, processPayload["envs"], "A", "B")
+	if gotPayload["stdin"] != false {
+		t.Fatalf("stdin=%#v", gotPayload["stdin"])
+	}
+	if result.Stdout != "cmd-out\n" || result.Stderr != "cmd-err\n" || result.ExitCode != 7 {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestFilesReadUsesEnvdHTTPFileAPI(t *testing.T) {
+	var gotHost string
+	var gotPath string
+	var gotToken string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/files" {
+			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+		}
+		gotHost = r.Host
+		gotPath = r.URL.Query().Get("path")
+		gotToken = r.Header.Get("X-Access-Token")
+		fmt.Fprint(w, "file content")
+	}))
+	defer server.Close()
+
+	host, port := serverHostPort(t, server.URL)
+	client := NewClient(Config{
+		ProxyNodeIP:    host,
+		ProxyPortHTTP:  port,
+		SandboxDomain:  "cube.test",
+		RequestTimeout: time.Second,
+	})
+	sb := &Sandbox{
+		client:          client,
+		SandboxID:       "sb-files",
+		TemplateID:      "tpl-test",
+		EnvdAccessToken: "envd-token",
+	}
+
+	content, err := sb.Files().Read(context.Background(), "/tmp/foo bar.txt")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if content != "file content" {
+		t.Fatalf("content=%q", content)
+	}
+	if gotHost != "49999-sb-files.cube.test" || gotPath != "/tmp/foo bar.txt" || gotToken != "envd-token" {
+		t.Fatalf("host/path/token=%q/%q/%q", gotHost, gotPath, gotToken)
+	}
+}
+
+func TestFilesReadReturnsEnvdFileError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"file not found"}`, http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	host, port := serverHostPort(t, server.URL)
+	client := NewClient(Config{
+		ProxyNodeIP:    host,
+		ProxyPortHTTP:  port,
+		SandboxDomain:  "cube.test",
+		RequestTimeout: time.Second,
+	})
+	sb := &Sandbox{client: client, SandboxID: "sb-files", TemplateID: "tpl-test"}
+
+	_, err := sb.Files().Read(context.Background(), "/tmp/missing.txt")
+	if err == nil || !strings.Contains(err.Error(), "failed to read /tmp/missing.txt") || !strings.Contains(err.Error(), "file not found") {
+		t.Fatalf("error=%v", err)
+	}
+	if errors.Is(err, ErrSandboxNotFound) {
+		t.Fatalf("file read 404 should not be classified as sandbox not found: %v", err)
 	}
 }
 
@@ -537,6 +733,41 @@ func (r *fakeRunner) RunCode(_ context.Context, code string, opts RunCodeOptions
 	return r.execution, r.err
 }
 
+type fakeProcessStarter struct {
+	payload processStartRequest
+	opts    CommandOptions
+	result  *processStartResult
+	err     error
+}
+
+func (s *fakeProcessStarter) startProcess(_ context.Context, payload processStartRequest, opts CommandOptions) (*processStartResult, error) {
+	s.payload = payload
+	s.opts = opts
+	if s.result == nil {
+		s.result = &processStartResult{}
+	}
+	return s.result, s.err
+}
+
+type fakeFileReader struct {
+	path    string
+	content string
+	err     error
+}
+
+func (r *fakeFileReader) readFile(_ context.Context, path string) (string, error) {
+	r.path = path
+	return r.content, r.err
+}
+
+func connectEnvelope(flags byte, payload string) []byte {
+	frame := make([]byte, 5+len(payload))
+	frame[0] = flags
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
+	copy(frame[5:], payload)
+	return frame
+}
+
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -545,6 +776,7 @@ func clearEnv(t *testing.T) {
 		"CUBE_TEMPLATE_ID",
 		"CUBE_PROXY_NODE_IP",
 		"CUBE_PROXY_PORT_HTTP",
+		"CUBE_PROXY_SCHEME",
 		"CUBE_SANDBOX_DOMAIN",
 		"CUBE_TIMEOUT",
 		"CUBE_REQUEST_TIMEOUT",

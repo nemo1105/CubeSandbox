@@ -154,11 +154,14 @@ func TestIntegrationSandboxExecutionCommandsFilesAndErrors(t *testing.T) {
 	}
 
 	path := "/tmp/cubesandbox-go-sdk-integration.txt"
-	_, err = sb.RunCode(ctx, fmt.Sprintf("open(%q, 'w').write('file-content-ok')", path), RunCodeOptions{
+	writeFile, err := sb.Commands().Run(ctx, fmt.Sprintf("printf %%s file-content-ok > %s", path), CommandOptions{
 		Timeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("write fixture file returned error: %v", err)
+	}
+	if writeFile.ExitCode != 0 {
+		t.Fatalf("write fixture command failed: %#v", writeFile)
 	}
 	content, err := sb.Files().Read(ctx, path)
 	if err != nil {
